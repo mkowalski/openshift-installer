@@ -523,6 +523,17 @@ func ValidatePlatform(p *baremetal.Platform, agentBasedInstallation bool, n *typ
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("dnsRecordsType"), c.BareMetal.DNSRecordsType, "external DNS records can only be configured with user-managed loadbalancers"))
 	}
 
+	if p.BGPVIPConfig != nil {
+		allErrs = append(allErrs, validateBGPVIPConfig(p.BGPVIPConfig, fldPath.Child("bgpVIPConfig"))...)
+	}
+
+	for i, host := range p.Hosts {
+		for j, peer := range host.BGPPeers {
+			hostPath := fldPath.Child("hosts").Index(i).Child("bgpPeers").Index(j)
+			allErrs = append(allErrs, validateBGPPeer(peer, hostPath)...)
+		}
+	}
+
 	return allErrs
 }
 
@@ -551,6 +562,61 @@ func validateLoadBalancer(lbType configv1.PlatformLoadBalancerType) bool {
 	default:
 		return false
 	}
+}
+
+func validateBGPVIPConfig(bgpConfig *baremetal.BGPVIPConfig, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if bgpConfig == nil {
+		return allErrs
+	}
+
+	// Validate LocalASN
+	if bgpConfig.LocalASN < 1 || bgpConfig.LocalASN > 4294967295 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("localASN"), bgpConfig.LocalASN,
+			"must be between 1 and 4294967295"))
+	}
+
+	// Validate Peers
+	if len(bgpConfig.Peers) == 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("peers"), "at least one BGP peer is required"))
+	}
+	if len(bgpConfig.Peers) > 16 {
+		allErrs = append(allErrs, field.TooMany(fldPath.Child("peers"), len(bgpConfig.Peers), 16))
+	}
+
+	for i, peer := range bgpConfig.Peers {
+		peerPath := fldPath.Child("peers").Index(i)
+		allErrs = append(allErrs, validateBGPPeer(peer, peerPath)...)
+	}
+
+	return allErrs
+}
+
+func validateBGPPeer(peer baremetal.BGPPeerConfig, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+
+	if peer.PeerAddress == "" {
+		allErrs = append(allErrs, field.Required(fldPath.Child("peerAddress"), "peer address is required"))
+	} else if ip := net.ParseIP(peer.PeerAddress); ip == nil {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("peerAddress"), peer.PeerAddress, "must be a valid IP address"))
+	}
+
+	if peer.PeerASN < 1 || peer.PeerASN > 4294967295 {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("peerASN"), peer.PeerASN,
+			"must be between 1 and 4294967295"))
+	}
+
+	if peer.BFDEnabled != "" && peer.BFDEnabled != "true" && peer.BFDEnabled != "false" {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("bfdEnabled"), peer.BFDEnabled,
+			`must be "true", "false", or empty`))
+	}
+
+	if peer.EBGPMultiHop != "" && peer.EBGPMultiHop != "true" && peer.EBGPMultiHop != "false" {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("ebgpMultiHop"), peer.EBGPMultiHop,
+			`must be "true", "false", or empty`))
+	}
+
+	return allErrs
 }
 
 // ValidateProvisioning checks that provisioning network requirements specified is valid.
