@@ -1,1 +1,3 @@
 /bin/
+terraform/bin/linux_amd64/terraform-provider-alicloud
+terraform/bin/linux_amd64/terraform-provider-alicloud.zip
