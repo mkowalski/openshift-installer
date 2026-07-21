@@ -145,9 +145,6 @@ clusterversions.config.openshift.io:
   Capability: ""
   Category: ""
   FeatureGates:
-  - CRDCompatibilityRequirementOperator
-  - CRDCompatibilityRequirementOperator+ClusterAPIMachineManagement
-  - ClusterAPIMachineManagement
   - ClusterUpdateAcceptRisks
   - ClusterUpdatePreflight
   - ImageStreamImportMode
@@ -375,6 +372,7 @@ infrastructures.config.openshift.io:
   - AWSDualStackInstall
   - AzureClusterHostedDNSInstall
   - AzureDualStackInstall
+  - BGPBasedVIPManagement
   - DualReplica
   - DyanmicServiceEndpointIBMCloud
   - NutanixMultiSubnets

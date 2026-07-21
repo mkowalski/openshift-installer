@@ -390,4 +390,4 @@ replace (
 	sigs.k8s.io/cluster-api-provider-azure => github.com/mboersma/cluster-api-provider-azure v0.3.1-0.20251030205607-3161b9cc8d3e
 )
 
-replace github.com/openshift/api => /home/kmateusz/git/github.com/openshift-api
+replace github.com/openshift/api => /home/kmateusz/git/github.com/openshift-api-pre136
