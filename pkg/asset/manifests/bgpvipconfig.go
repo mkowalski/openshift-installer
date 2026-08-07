@@ -2,16 +2,17 @@ package manifests
 
 import (
 	"context"
-	"encoding/json"
 	"path"
+	"time"
 
 	"github.com/pkg/errors"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
+	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
 	"github.com/openshift/installer/pkg/asset"
 	"github.com/openshift/installer/pkg/asset/installconfig"
+	"github.com/openshift/installer/pkg/types"
 	"github.com/openshift/installer/pkg/types/baremetal"
 )
 
@@ -19,28 +20,102 @@ var (
 	bgpVIPConfigMapFileName = path.Join(manifestDir, "bgp-vip-config.yaml")
 )
 
-const (
-	bgpVIPConfigMapName      = "bgp-vip-config"
-	bgpVIPConfigMapNamespace = "openshift-network-operator"
-	bgpVIPConfigMapDataKey   = "config.json"
-)
-
-// bgpVIPConfigJSON is the JSON structure stored in the ConfigMap. Its field
-// names match baremetal-runtimecfg's FRRPeerMapping so the same JSON can be
-// written verbatim to /etc/kubernetes/static-pod-resources/frr-k8s/frr-peers.json.
-type bgpVIPConfigJSON struct {
-	LocalASN      int64                                `json:"localASN"`
-	DefaultPeers  []baremetal.BGPPeerConfig            `json:"defaultPeers"`
-	Communities   []string                             `json:"communities,omitempty"`
-	APIVIPs       []string                             `json:"apiVIPs"`
-	IngressVIPs   []string                             `json:"ingressVIPs"`
-	HostOverrides map[string][]baremetal.BGPPeerConfig `json:"hostOverrides,omitempty"`
+// bgpBoolFlagToBFDMode converts the install-config string flag ("true",
+// "false" or "") to the CRD enum. An empty value stays empty: defaults are
+// applied by the consuming controllers, not by this conversion.
+func bgpBoolFlagToBFDMode(v string) mcfgv1alpha1.BFDMode {
+	switch v {
+	case "true":
+		return mcfgv1alpha1.BFDModeEnabled
+	case "false":
+		return mcfgv1alpha1.BFDModeDisabled
+	}
+	return ""
 }
 
-// BGPVIPConfigMap generates the bgp-vip-config ConfigMap for CNO.
+// bgpBoolFlagToEBGPMultiHopMode converts the install-config string flag
+// ("true", "false" or "") to the CRD enum, keeping empty values empty.
+func bgpBoolFlagToEBGPMultiHopMode(v string) mcfgv1alpha1.EBGPMultiHopMode {
+	switch v {
+	case "true":
+		return mcfgv1alpha1.EBGPMultiHopModeEnabled
+	case "false":
+		return mcfgv1alpha1.EBGPMultiHopModeDisabled
+	}
+	return ""
+}
+
+// bgpDurationToSeconds converts an install-config duration string (e.g.
+// "90s") to whole seconds. Empty or unparsable values map to 0 (omitted).
+func bgpDurationToSeconds(v string) int32 {
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0
+	}
+	return int32(d.Seconds())
+}
+
+func bgpPeerToCR(p baremetal.BGPPeerConfig) mcfgv1alpha1.BGPVIPPeer {
+	return mcfgv1alpha1.BGPVIPPeer{
+		PeerAddress:          p.PeerAddress,
+		PeerASN:              p.PeerASN,
+		Password:             p.Password,
+		Port:                 p.Port,
+		BFD:                  bgpBoolFlagToBFDMode(p.BFDEnabled),
+		EBGPMultiHop:         bgpBoolFlagToEBGPMultiHopMode(p.EBGPMultiHop),
+		HoldTimeSeconds:      bgpDurationToSeconds(p.HoldTime),
+		KeepaliveTimeSeconds: bgpDurationToSeconds(p.KeepaliveTime),
+	}
+}
+
+// bgpVIPConfigFromInstallConfig converts the baremetal platform's
+// BGPVIPConfig install-config section into the machineconfiguration
+// BGPVIPConfig singleton CR named "cluster". apiVIPs/ingressVIPs are not
+// part of the CR and are intentionally dropped.
+func bgpVIPConfigFromInstallConfig(ic *types.InstallConfig) *mcfgv1alpha1.BGPVIPConfig {
+	bm := ic.Platform.BareMetal
+	bgpConfig := bm.BGPVIPConfig
+
+	cr := &mcfgv1alpha1.BGPVIPConfig{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: mcfgv1alpha1.GroupVersion.String(),
+			Kind:       "BGPVIPConfig",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster",
+		},
+		Spec: mcfgv1alpha1.BGPVIPConfigSpec{
+			LocalASN:    bgpConfig.LocalASN,
+			Communities: bgpConfig.Communities,
+		},
+	}
+
+	for _, p := range bgpConfig.Peers {
+		cr.Spec.DefaultPeers = append(cr.Spec.DefaultPeers, bgpPeerToCR(p))
+	}
+
+	for _, host := range bm.Hosts {
+		if host == nil || len(host.BGPPeers) == 0 {
+			continue
+		}
+		override := mcfgv1alpha1.BGPVIPHostPeers{Hostname: host.Name}
+		for _, p := range host.BGPPeers {
+			override.Peers = append(override.Peers, bgpPeerToCR(p))
+		}
+		cr.Spec.HostOverrides = append(cr.Spec.HostOverrides, override)
+	}
+
+	return cr
+}
+
+// BGPVIPConfigMap generates the BGPVIPConfig custom resource manifest for
+// the BGP VIP feature.
 type BGPVIPConfigMap struct {
-	ConfigMap *corev1.ConfigMap
-	File      *asset.File
+	Config *mcfgv1alpha1.BGPVIPConfig
+	File   *asset.File
 }
 
 var _ asset.WritableAsset = (*BGPVIPConfigMap)(nil)
@@ -58,7 +133,7 @@ func (*BGPVIPConfigMap) Dependencies() []asset.Asset {
 	}
 }
 
-// Generate generates the BGP VIP Config ConfigMap.
+// Generate generates the BGPVIPConfig custom resource manifest.
 func (b *BGPVIPConfigMap) Generate(_ context.Context, dependencies asset.Parents) error {
 	installConfig := &installconfig.InstallConfig{}
 	dependencies.Get(installConfig)
@@ -70,55 +145,16 @@ func (b *BGPVIPConfigMap) Generate(_ context.Context, dependencies asset.Parents
 		return nil
 	}
 
-	bm := installConfig.Config.Platform.BareMetal
-	bgpConfig := bm.BGPVIPConfig
+	cr := bgpVIPConfigFromInstallConfig(installConfig.Config)
 
-	configData := bgpVIPConfigJSON{
-		LocalASN:     bgpConfig.LocalASN,
-		DefaultPeers: bgpConfig.Peers,
-		Communities:  bgpConfig.Communities,
-		APIVIPs:      bm.APIVIPs,
-		IngressVIPs:  bm.IngressVIPs,
-	}
-
-	// Collect per-host BGP peer overrides.
-	hostOverrides := make(map[string][]baremetal.BGPPeerConfig)
-	for _, host := range bm.Hosts {
-		if host != nil && len(host.BGPPeers) > 0 {
-			hostOverrides[host.Name] = host.BGPPeers
-		}
-	}
-	if len(hostOverrides) > 0 {
-		configData.HostOverrides = hostOverrides
-	}
-
-	jsonBytes, err := json.Marshal(configData)
-	if err != nil {
-		return errors.Wrap(err, "failed to marshal BGP VIP config JSON")
-	}
-
-	cm := &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: corev1.SchemeGroupVersion.String(),
-			Kind:       "ConfigMap",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: bgpVIPConfigMapNamespace,
-			Name:      bgpVIPConfigMapName,
-		},
-		Data: map[string]string{
-			bgpVIPConfigMapDataKey: string(jsonBytes),
-		},
-	}
-
-	cmData, err := yaml.Marshal(cm)
+	crData, err := yaml.Marshal(cr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create %s manifest", b.Name())
 	}
-	b.ConfigMap = cm
+	b.Config = cr
 	b.File = &asset.File{
 		Filename: bgpVIPConfigMapFileName,
-		Data:     cmData,
+		Data:     crData,
 	}
 	return nil
 }
