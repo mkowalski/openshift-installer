@@ -2,10 +2,14 @@ package manifests
 
 import (
 	"context"
+	"fmt"
 	"path"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 
@@ -18,7 +22,48 @@ import (
 
 var (
 	bgpVIPConfigMapFileName = path.Join(manifestDir, "bgp-vip-config.yaml")
+
+	bgpNameSanitizeRE = regexp.MustCompile(`[:.]+`)
+	bgpNameSqueezeRE  = regexp.MustCompile(`-+`)
 )
+
+// bgpSanitizeNameComponent turns an address or hostname into an RFC 1123
+// label fragment: lowercase, ':' and '.' replaced by '-', repeated '-'
+// squeezed, leading/trailing '-' trimmed.
+func bgpSanitizeNameComponent(s string) string {
+	s = strings.ToLower(s)
+	s = bgpNameSanitizeRE.ReplaceAllString(s, "-")
+	s = bgpNameSqueezeRE.ReplaceAllString(s, "-")
+	return strings.Trim(s, "-")
+}
+
+// bgpPeerSecretName returns the deterministic Secret name for a peer's BGP
+// password. hostname is empty for default peers.
+func bgpPeerSecretName(hostname, address string) string {
+	if hostname == "" {
+		return fmt.Sprintf("bgp-vip-peer-%s", bgpSanitizeNameComponent(address))
+	}
+	return fmt.Sprintf("bgp-vip-peer-%s-%s", bgpSanitizeNameComponent(hostname), bgpSanitizeNameComponent(address))
+}
+
+// bgpPeerPasswordSecret builds the kubernetes.io/basic-auth Secret carrying
+// the peer's BGP password in the openshift-config namespace.
+func bgpPeerPasswordSecret(name, password string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "openshift-config",
+		},
+		Type: corev1.SecretTypeBasicAuth,
+		Data: map[string][]byte{
+			"password": []byte(password),
+		},
+	}
+}
 
 // bgpBoolFlagToBFDMode converts the install-config string flag ("true",
 // "false" or "") to the CRD enum. An empty value stays empty: defaults are
@@ -58,26 +103,35 @@ func bgpDurationToSeconds(v string) int32 {
 	return int32(d.Seconds())
 }
 
-func bgpPeerToCR(p baremetal.BGPPeerConfig) mcfgv1alpha1.BGPVIPPeer {
-	return mcfgv1alpha1.BGPVIPPeer{
+func bgpPeerToCR(p baremetal.BGPPeerConfig, hostname string, secrets *[]*corev1.Secret) mcfgv1alpha1.BGPVIPPeer {
+	peer := mcfgv1alpha1.BGPVIPPeer{
 		PeerAddress:          p.PeerAddress,
 		PeerASN:              p.PeerASN,
-		Password:             p.Password,
 		Port:                 p.Port,
 		BFD:                  bgpBoolFlagToBFDMode(p.BFDEnabled),
 		EBGPMultiHop:         bgpBoolFlagToEBGPMultiHopMode(p.EBGPMultiHop),
 		HoldTimeSeconds:      bgpDurationToSeconds(p.HoldTime),
 		KeepaliveTimeSeconds: bgpDurationToSeconds(p.KeepaliveTime),
 	}
+	if p.Password != "" {
+		name := bgpPeerSecretName(hostname, p.PeerAddress)
+		peer.PasswordSecret = mcfgv1alpha1.BGPVIPPasswordSecret{Name: name}
+		*secrets = append(*secrets, bgpPeerPasswordSecret(name, p.Password))
+	}
+	return peer
 }
 
 // bgpVIPConfigFromInstallConfig converts the baremetal platform's
 // BGPVIPConfig install-config section into the machineconfiguration
-// BGPVIPConfig singleton CR named "cluster". apiVIPs/ingressVIPs are not
-// part of the CR and are intentionally dropped.
-func bgpVIPConfigFromInstallConfig(ic *types.InstallConfig) *mcfgv1alpha1.BGPVIPConfig {
+// BGPVIPConfig singleton CR named "cluster", plus the peer password
+// Secrets referenced by it. apiVIPs/ingressVIPs are not part of the CR and
+// are intentionally dropped. Install-config inline peer passwords are moved
+// into kubernetes.io/basic-auth Secrets in the openshift-config namespace;
+// the CR carries only the reference.
+func bgpVIPConfigFromInstallConfig(ic *types.InstallConfig) (*mcfgv1alpha1.BGPVIPConfig, []*corev1.Secret) {
 	bm := ic.Platform.BareMetal
 	bgpConfig := bm.BGPVIPConfig
+	var secrets []*corev1.Secret
 
 	cr := &mcfgv1alpha1.BGPVIPConfig{
 		TypeMeta: metav1.TypeMeta{
@@ -94,7 +148,7 @@ func bgpVIPConfigFromInstallConfig(ic *types.InstallConfig) *mcfgv1alpha1.BGPVIP
 	}
 
 	for _, p := range bgpConfig.Peers {
-		cr.Spec.DefaultPeers = append(cr.Spec.DefaultPeers, bgpPeerToCR(p))
+		cr.Spec.DefaultPeers = append(cr.Spec.DefaultPeers, bgpPeerToCR(p, "", &secrets))
 	}
 
 	for _, host := range bm.Hosts {
@@ -103,19 +157,19 @@ func bgpVIPConfigFromInstallConfig(ic *types.InstallConfig) *mcfgv1alpha1.BGPVIP
 		}
 		override := mcfgv1alpha1.BGPVIPHostPeers{Hostname: host.Name}
 		for _, p := range host.BGPPeers {
-			override.Peers = append(override.Peers, bgpPeerToCR(p))
+			override.Peers = append(override.Peers, bgpPeerToCR(p, host.Name, &secrets))
 		}
 		cr.Spec.HostOverrides = append(cr.Spec.HostOverrides, override)
 	}
 
-	return cr
+	return cr, secrets
 }
 
 // BGPVIPConfigMap generates the BGPVIPConfig custom resource manifest for
-// the BGP VIP feature.
+// the BGP VIP feature, along with peer password Secret manifests.
 type BGPVIPConfigMap struct {
-	Config *mcfgv1alpha1.BGPVIPConfig
-	File   *asset.File
+	Config   *mcfgv1alpha1.BGPVIPConfig
+	FileList []*asset.File
 }
 
 var _ asset.WritableAsset = (*BGPVIPConfigMap)(nil)
@@ -145,26 +199,34 @@ func (b *BGPVIPConfigMap) Generate(_ context.Context, dependencies asset.Parents
 		return nil
 	}
 
-	cr := bgpVIPConfigFromInstallConfig(installConfig.Config)
+	cr, secrets := bgpVIPConfigFromInstallConfig(installConfig.Config)
 
 	crData, err := yaml.Marshal(cr)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create %s manifest", b.Name())
 	}
 	b.Config = cr
-	b.File = &asset.File{
+	b.FileList = []*asset.File{{
 		Filename: bgpVIPConfigMapFileName,
 		Data:     crData,
+	}}
+	for _, secret := range secrets {
+		secretData, err := yaml.Marshal(secret)
+		if err != nil {
+			return errors.Wrapf(err, "failed to create %s peer password secret manifest", b.Name())
+		}
+		b.FileList = append(b.FileList, &asset.File{
+			Filename: path.Join(openshiftManifestDir, fmt.Sprintf("bgp-vip-peer-secret-%s.yaml", secret.Name)),
+			Data:     secretData,
+		})
 	}
+	asset.SortFiles(b.FileList)
 	return nil
 }
 
 // Files returns the files generated by the asset.
 func (b *BGPVIPConfigMap) Files() []*asset.File {
-	if b.File != nil {
-		return []*asset.File{b.File}
-	}
-	return []*asset.File{}
+	return b.FileList
 }
 
 // Load loads the already-rendered files back from disk.
