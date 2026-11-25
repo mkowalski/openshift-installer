@@ -486,6 +486,12 @@ type NodeExporterCollectorConfig struct {
 	// nvmExpressSubsystem is optional.
 	// When omitted, this means no opinion and the platform is left to choose a reasonable default,
 	// which is subject to change over time. The current default is enabled.
+	// When enabled, if /sys/class/nvme-subsystem/ is missing or inaccessible, node-exporter
+	// reports node_scrape_collector_success{collector="nvmesubsystem"} as 0.
+	// This is intentional and helps detect missing drivers or configuration problems.
+	// If no nodes in the cluster require NVMe subsystem monitoring, set
+	// nvmExpressSubsystem.collectionPolicy to DoNotCollect to disable this collector cluster-wide.
+	// This setting does not support per-node configuration.
 	// +optional
 	NVMExpressSubsystem NodeExporterCollectorNVMExpressSubsystemConfig `json:"nvmExpressSubsystem,omitzero"`
 	// interrupts configures the interrupts collector, which exposes interrupt counts
@@ -1616,29 +1622,45 @@ type AdditionalAlertmanagerConfig struct {
 	// The current default value is `HTTP`.
 	// +optional
 	Scheme AlertmanagerScheme `json:"scheme,omitempty"`
-	// staticConfigs is a list of statically configured Alertmanager endpoints in the form
-	// of `<host>:<port>`. Each entry must be a valid hostname, IPv4 address, or IPv6 address
-	// (in brackets) followed by a colon and a valid port number (1-65535).
-	// Examples: "alertmanager.example.com:9093", "192.168.1.100:9093", "[::1]:9093"
+	// staticConfigs is a list of statically configured Alertmanager endpoints.
+	// Each entry must be a valid hostname, IPv4 address, or IPv6 address (in brackets),
+	// optionally followed by a colon and a port number (1-65535).
+	// When the port is omitted, Prometheus uses the default port for the configured scheme
+	// (80 for HTTP, 443 for HTTPS).
+	// Examples: "alertmanager.example.com", "alertmanager.example.com:9093", "192.168.1.100:9093", "[::1]:9093"
 	// At least one endpoint must be specified (minimum 1, maximum 10 endpoints).
 	// Each entry must be unique and non-empty (empty string is invalid).
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=10
 	// +kubebuilder:validation:items:MinLength=1
 	// +kubebuilder:validation:items:MaxLength=255
-	// +kubebuilder:validation:items:XValidation:rule="isURL('http://' + self) && size(url('http://' + self).getHostname()) > 0 && size(url('http://' + self).getPort()) > 0 && int(url('http://' + self).getPort()) >= 1 && int(url('http://' + self).getPort()) <= 65535",message="must be a valid 'host:port' where host is a DNS name, IPv4, or IPv6 address (in brackets), and port is 1-65535"
+	// +kubebuilder:validation:items:XValidation:rule="isURL('http://' + self) && size(url('http://' + self).getHostname()) > 0 && (size(url('http://' + self).getPort()) == 0 || (int(url('http://' + self).getPort()) >= 1 && int(url('http://' + self).getPort()) <= 65535))",message="must be a valid host or host:port where host is a DNS name, IPv4, or IPv6 address (in brackets), and port (if specified) is 1-65535"
 	// +listType=set
 	// +required
 	StaticConfigs []string `json:"staticConfigs,omitempty"`
+
+	// TOMBSTONE: This field has been tombstoned in favor of the `timeoutMilliseconds` field. This tombstone will be dropped when promoting this API to v1.
+	// ---
 	// timeoutSeconds defines the timeout in seconds for requests to Alertmanager.
 	// When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.
 	// Currently the default is 10 seconds.
 	// Minimum value is 1 second.
 	// Maximum value is 600 seconds (10 minutes).
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=600
+	// Former marker: kubebuilder:validation:Minimum=1
+	// Former marker: kubebuilder:validation:Maximum=600
+	// Former marker: optional
+	// TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// timeoutMilliseconds defines the timeout in milliseconds for requests to Alertmanager.
+	// When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.
+	// Currently the default is 10000 milliseconds (10 seconds).
+	// Minimum value is 100 milliseconds.
+	// Maximum value is 600000 milliseconds (10 minutes).
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=600000
 	// +optional
-	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+	TimeoutMilliseconds int32 `json:"timeoutMilliseconds,omitempty"`
+
 	// tlsConfig defines the TLS settings to use for Alertmanager connections.
 	// When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.
 	// +optional
@@ -2154,10 +2176,10 @@ type RelabelConfig struct {
 	// Must be a valid RE2 regular expression (https://github.com/google/re2/wiki/Syntax).
 	// When omitted, this means no opinion and the platform is left to choose a reasonable default, which is subject to change over time.
 	// The default value is "(.*)" to match everything.
-	// Must be between 1 and 1000 characters in length when specified.
+	// Must be between 1 and 8192 characters in length when specified.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=1000
+	// +kubebuilder:validation:MaxLength=8192
 	Regex string `json:"regex,omitempty"`
 
 	// action defines the action to perform on the matched labels and its configuration.
